@@ -47,6 +47,8 @@ from collections import Counter
 from skimage.measure import approximate_polygon, find_contours
 from skimage.morphology import skeletonize
 from scipy.spatial import KDTree, ConvexHull
+from scipy.optimize import linear_sum_assignment
+import heapq
 import networkx as nx
 import osmnx as ox
 import gpxpy
@@ -70,7 +72,15 @@ from matplotlib.path import Path as MplPath
 CITY_NAME = "Manhattan, New York, USA"
 ROUTE_DISTANCE_KM = 10
 ROUTE_DISTANCE_METERS = ROUTE_DISTANCE_KM * 1000
-ROUTE_DISTANCE_CORRECTION = 0.85
+
+# --- Distance Correction Loop (NEW) ---
+# Replaces the old static ROUTE_DISTANCE_CORRECTION constant. The correction
+# factor now starts at 0.85 and is iteratively adjusted post-hoc based on the
+# actual routed distance, until it lies within DISTANCE_CORRECTION_TOLERANCE
+# of the target (or DISTANCE_CORRECTION_MAX_ITERS retries are exhausted).
+DISTANCE_CORRECTION_INITIAL = 0.85
+DISTANCE_CORRECTION_MAX_ITERS = 2
+DISTANCE_CORRECTION_TOLERANCE = 0.10
 
 # --- Image ---
 IMAGE_FOLDER = "../images"
@@ -593,6 +603,54 @@ def compute_density_weights(Q_city, grid_size=50.0):
 # - Bounding-box guard
 
 # %%
+def resample_sketch_edges(P_sketch, E_sketch, max_spacing_ratio=0.05):
+    """
+    Add intermediate points along sketch edges that are longer than
+    max_spacing_ratio × sketch_diameter. This gives ICP more constraints
+    along straight edges, preventing ballooning/pinching between corners.
+
+    Returns:
+        P_new: (n_new, 2) resampled points
+        E_new: (k_new, 2) resampled edges
+        original_indices: (n_original,) indices into P_new for original points
+    """
+    P_sketch = np.asarray(P_sketch, dtype=float)
+    E_sketch = np.asarray(E_sketch)
+    if len(P_sketch) == 0:
+        return P_sketch.copy(), E_sketch.copy(), np.arange(len(P_sketch))
+
+    diameter = float(np.max(np.ptp(P_sketch, axis=0))) if len(P_sketch) > 1 else 0.0
+    threshold = max_spacing_ratio * diameter
+    if threshold < 1e-6:
+        return P_sketch.copy(), E_sketch.copy(), np.arange(len(P_sketch))
+
+    new_points = [pt for pt in P_sketch]
+    original_indices = list(range(len(P_sketch)))
+    new_edges = []
+
+    for p1, p2 in E_sketch:
+        p1 = int(p1)
+        p2 = int(p2)
+        dist = float(np.linalg.norm(P_sketch[p2] - P_sketch[p1]))
+        if dist > threshold:
+            n_segments = int(np.ceil(dist / threshold))
+            interp = np.linspace(P_sketch[p1], P_sketch[p2], n_segments + 1)
+            start_idx = len(new_points)
+            for pt in interp[1:-1]:
+                new_points.append(pt)
+            indices_chain = (
+                [p1]
+                + list(range(start_idx, start_idx + n_segments - 1))
+                + [p2]
+            )
+            for i in range(len(indices_chain) - 1):
+                new_edges.append([indices_chain[i], indices_chain[i + 1]])
+        else:
+            new_edges.append([p1, p2])
+
+    return np.array(new_points), np.array(new_edges), np.array(original_indices)
+
+
 def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
                      density_weights,
                      num_iterations=100, num_random_samples=300,
@@ -603,7 +661,8 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
                      penalty_anneal_start=4.0, penalty_anneal_end=0.5,
                      grid_search=True, grid_step_factor=0.6,
                      scale_factors=None, shape_priority=None,
-                     shape_constrained_k=5, shape_angle_weight=10.0):
+                     shape_constrained_k=5, shape_angle_weight=10.0,
+                     G_proj=None, node_ids=None):
     """
     Shape-priority ICP v4: grid+random search, multi-scale, shape-first scoring,
     angle-constrained matching.
@@ -638,13 +697,30 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
         shape_priority: Shape vs distance blend (0-1), or None for auto.
         shape_constrained_k: k nearest alternatives for angle-constrained matching.
         shape_angle_weight: Weight for angular distortion in post-matching.
+        G_proj: Optional projected city graph (NetworkX) for street-distance
+            queries during top-N candidate re-scoring and topology-aware
+            refinement. If None, those steps are skipped.
+        node_ids: Optional (m,) array of OSM node IDs aligned with Q_city.
+            Required alongside G_proj.
 
     Returns:
         R: (2, 2) rotation matrix.
         t: (2,) translation vector.
         s: Scale factor applied to sketch.
-        matched_indices: Indices of matched points in Q_city.
+        matched_indices: Indices of matched points in Q_city, restricted to
+            the original (un-resampled) sketch points.
     """
+    # Resample sketch edges for denser ICP constraints. The closure functions
+    # below operate on the resampled P_sketch/E_sketch; we map matches back to
+    # the original points before returning.
+    P_sketch_orig = np.asarray(P_sketch)
+    E_sketch_orig = np.asarray(E_sketch)
+    P_sketch, E_sketch, original_point_indices = resample_sketch_edges(
+        P_sketch_orig, E_sketch_orig)
+    if len(P_sketch) > len(P_sketch_orig):
+        print(f"  Resampled: {len(P_sketch_orig)} -> {len(P_sketch)} points, "
+              f"{len(E_sketch_orig)} -> {len(E_sketch)} edges")
+
     n_sketch = len(P_sketch)
     route_km = route_distance_meters / 1000.0
 
@@ -712,37 +788,39 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
         return mean_angle_error + ratio_variance
 
     def enforce_uniqueness(P_transformed, indices, city_kdtree):
-        """At final matching: ensure each city node is used at most once."""
+        """At final matching: ensure each city node is used at most once.
+        Uses Hungarian algorithm for optimal one-to-one assignment."""
+        n = len(P_transformed)
+        if n == 0:
+            return indices.copy()
+
+        k = min(30, len(Q_city))  # consider top-30 nearest neighbors
+        dists, knn = city_kdtree.query(P_transformed, k=k)
+        # Ensure 2D shape even when k == 1
+        if knn.ndim == 1:
+            knn = knn[:, None]
+            dists = dists[:, None]
+
+        # Collect all candidate city nodes
+        all_candidates = set()
+        for i in range(n):
+            for j in range(k):
+                all_candidates.add(int(knn[i, j]))
+        all_candidates = sorted(all_candidates)
+        cand_to_col = {c: j for j, c in enumerate(all_candidates)}
+
+        # Build cost matrix: n_sketch × n_candidates
+        cost_matrix = np.full((n, len(all_candidates)), 1e12)
+        for i in range(n):
+            for j in range(k):
+                city_idx = int(knn[i, j])
+                col = cand_to_col[city_idx]
+                cost_matrix[i, col] = dists[i, j]
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
         unique_indices = indices.copy()
-        used = {}
-        distances = np.linalg.norm(P_transformed - Q_city[indices], axis=1)
-
-        for s_idx in range(len(indices)):
-            c_idx = indices[s_idx]
-            d = distances[s_idx]
-            if c_idx not in used or d < used[c_idx][1]:
-                if c_idx in used:
-                    evicted = used[c_idx][0]
-                    unique_indices[evicted] = -1
-                used[c_idx] = (s_idx, d)
-            else:
-                unique_indices[s_idx] = -1
-
-        taken = set(used.keys())
-        evicted_mask = unique_indices == -1
-        if np.any(evicted_mask):
-            evicted_idxs = np.where(evicted_mask)[0]
-            k = min(20, len(Q_city))
-            _, knn_indices = city_kdtree.query(P_transformed[evicted_idxs], k=k)
-            for i, s_idx in enumerate(evicted_idxs):
-                for candidate in knn_indices[i]:
-                    if candidate not in taken:
-                        unique_indices[s_idx] = candidate
-                        taken.add(candidate)
-                        break
-                else:
-                    unique_indices[s_idx] = knn_indices[i, 0]
-
+        for r, c in zip(row_ind, col_ind):
+            unique_indices[r] = all_candidates[c]
         return unique_indices
 
     def angle_constrained_refinement(P_transformed, indices, city_kdtree,
@@ -753,17 +831,18 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
         Uses a combined score of distance + angle_weight × angular_distortion.
         """
         refined = indices.copy()
+        used = set(int(c) for c in refined)
         adj = {i: [] for i in range(n_sketch)}
         for p1, p2 in E_sketch:
-            adj[p1].append(p2)
-            adj[p2].append(p1)
+            adj[int(p1)].append(int(p2))
+            adj[int(p2)].append(int(p1))
 
         improvements = 0
         for i in range(n_sketch):
             if not adj[i]:
                 continue
 
-            current_idx = refined[i]
+            current_idx = int(refined[i])
             current_pos = Q_city[current_idx]
 
             def angular_cost(city_idx):
@@ -788,9 +867,12 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
             best_total = current_total
             best_idx = current_idx
 
-            for cand in candidates:
+            for cand in np.atleast_1d(candidates):
+                cand = int(cand)
                 if cand == current_idx:
                     continue
+                if cand in used and cand != current_idx:
+                    continue  # already claimed by another sketch point
                 cand_dist = np.linalg.norm(P_transformed[i] - Q_city[cand])
                 cand_cost = angular_cost(cand)
                 cand_total = cand_dist + angle_weight * cand_cost
@@ -799,6 +881,8 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
                     best_idx = cand
 
             if best_idx != current_idx:
+                used.discard(current_idx)
+                used.add(best_idx)
                 refined[i] = best_idx
                 improvements += 1
 
@@ -863,11 +947,20 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
     best_R, best_t, best_s = np.identity(2), np.zeros(2), base_s
     report_every = max(1, n_positions // 5)
 
+    # Top-K candidate tracking (max-heap of size <= top_k_candidates).
+    # Stored as (-total_error, counter, R, t, s) so heap[0] is the worst-of-best.
+    top_k_candidates = 10
+    candidate_heap = []
+    candidate_counter = 0
+
     for sf in scale_factors:
         s = base_s * sf
         P_scaled = P_sketch * s
         c_p = np.mean(P_scaled, axis=0)
         P_centered = P_scaled - c_p
+        sketch_diam = (float(np.max(np.ptp(P_scaled, axis=0)))
+                       if len(P_scaled) > 1 else 1.0)
+        euler_penalty_weight = 0.5  # tunable
 
         for i, start_pos in enumerate(starting_positions):
             if (i + 1) % report_every == 0:
@@ -915,19 +1008,135 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
                 penalty = shape_preservation_penalty(indices, R_sample, t_sample, s)
                 fidelity = shape_fidelity_score(indices, R_sample, t_sample, s)
 
+                # Estimate Eulerization overhead from odd-degree count of the
+                # matched-node sub-multigraph induced by the sketch edges.
+                degree_count = Counter()
+                for p1, p2 in E_sketch:
+                    degree_count[int(indices[int(p1)])] += 1
+                    degree_count[int(indices[int(p2)])] += 1
+                n_odd = sum(1 for d in degree_count.values() if d % 2 == 1)
+                # Each odd-degree pair needs ~1 backtrack edge; estimate avg
+                # backtrack length as sketch_diameter * 0.3.
+                euler_overhead_estimate = (n_odd / 2) * sketch_diam * 0.3
+
                 # Combined score: shape_multiplier boosts penalty for short routes
                 # fidelity captures proportionality (edge-length ratio variance)
                 effective_pw = penalty_weight * shape_multiplier
                 total_error = (density_penalty
                                + effective_pw * penalty
-                               + shape_priority * 500 * fidelity)
+                               + shape_priority * 500 * fidelity
+                               + euler_penalty_weight * euler_overhead_estimate)
 
                 if total_error < best_error:
                     best_error = total_error
                     best_R, best_t, best_s = R_sample.copy(), t_sample.copy(), s
 
+                # Maintain top-K candidates for street-distance re-scoring.
+                candidate_counter += 1
+                entry = (-total_error, candidate_counter,
+                         R_sample.copy(), t_sample.copy(), s)
+                if len(candidate_heap) < top_k_candidates:
+                    heapq.heappush(candidate_heap, entry)
+                elif -total_error > candidate_heap[0][0]:
+                    # New error is smaller than worst-of-best: replace.
+                    heapq.heapreplace(candidate_heap, entry)
+
     print(f"Search complete (best error: {best_error:.1f}). "
           f"Refining with adaptive shape penalty...")
+
+    # =====================================================================
+    # STREET-DISTANCE RE-SCORING for top candidates
+    # =====================================================================
+    if (G_proj is not None and node_ids is not None and len(candidate_heap) > 0
+            and route_distance_meters > 0):
+        # Sort ascending by total_error for stable iteration order.
+        top_candidates = sorted(candidate_heap, key=lambda x: -x[0])
+        print(f"  Re-scoring top {len(top_candidates)} candidates with street distances...")
+        best_street_score = float('inf')
+        sb_R, sb_t, sb_s = best_R, best_t, best_s
+        for rank, (neg_err, _cnt, R_cand, t_cand, s_cand) in enumerate(top_candidates):
+            err = -neg_err
+            P_cand = (R_cand @ (P_sketch * s_cand).T).T + t_cand
+            _, cand_indices = city_kdtree.query(P_cand)
+            total_street_dist = 0.0
+            for p1, p2 in E_sketch:
+                u_idx = int(cand_indices[int(p1)])
+                v_idx = int(cand_indices[int(p2)])
+                u_id = node_ids[u_idx]
+                v_id = node_ids[v_idx]
+                try:
+                    sd = nx.shortest_path_length(G_proj, u_id, v_id, weight='length')
+                except nx.NetworkXNoPath:
+                    euclid = np.linalg.norm(Q_city[u_idx] - Q_city[v_idx])
+                    sd = euclid * 3  # heavy penalty
+                total_street_dist += sd
+            street_deviation = abs(total_street_dist - route_distance_meters) / route_distance_meters
+            combined = err * 0.5 + street_deviation * route_distance_meters * 0.5
+            if combined < best_street_score:
+                best_street_score = combined
+                sb_R, sb_t, sb_s = R_cand, t_cand, s_cand
+        if (sb_R is not best_R or sb_t is not best_t or sb_s != best_s):
+            print(f"  Street-distance rescoring promoted a different candidate "
+                  f"(scale {sb_s:.4f}).")
+        best_R, best_t, best_s = sb_R, sb_t, sb_s
+
+    # =====================================================================
+    # FINE-GRAINED SCALE SWEEP around the chosen candidate
+    # =====================================================================
+    print(f"  Fine-tuning scale around {best_s:.4f}...")
+    fine_scales = np.linspace(best_s * 0.90, best_s * 1.10, 11)  # ±10% in 2% steps
+    fine_best_error = best_error
+    fine_best_R, fine_best_t, fine_best_s = best_R, best_t, best_s
+
+    # Centroid of the sketch at best_s, used to adjust translation when
+    # changing scale.
+    P_best_scaled = P_sketch * best_s
+    c_p_best = np.mean(P_best_scaled, axis=0)
+
+    for fs in fine_scales:
+        P_fine = P_sketch * fs
+        c_p_fine = np.mean(P_fine, axis=0)
+        P_centered_fine = P_fine - c_p_fine
+
+        # Use best_R and best_t as starting point, adjusted for new scale.
+        R_fine = best_R.copy()
+        t_fine = best_t + best_R @ (c_p_best - c_p_fine)
+
+        # Run a few ICP iterations.
+        for _ in range(sample_iterations):
+            P_transformed = (R_fine @ P_fine.T).T + t_fine
+            distances, indices = city_kdtree.query(P_transformed)
+            Q_matched = Q_city[indices]
+            c_q = np.mean(Q_matched, axis=0)
+            Q_c = Q_matched - c_q
+            W = Q_c.T @ P_centered_fine
+            U, _, Vt = np.linalg.svd(W)
+            R_new = U @ Vt
+            if np.linalg.det(R_new) < 0:
+                Vt[1, :] *= -1
+                R_new = U @ Vt
+            t_new = c_q - R_new @ c_p_fine
+            R_fine, t_fine = R_new, t_new
+
+        # Score (same composition as global-search scoring, minus euler estimate
+        # which is comparatively expensive and not needed for fine-tuning).
+        P_final_fine = (R_fine @ P_fine.T).T + t_fine
+        distances, indices = city_kdtree.query(P_final_fine)
+        n_city = len(Q_city)
+        dp = np.sum(distances ** 2 / (density_weights[indices] * n_city + 1e-12))
+        pen = shape_preservation_penalty(indices, R_fine, t_fine, fs)
+        fid = shape_fidelity_score(indices, R_fine, t_fine, fs)
+        effective_pw = penalty_weight * shape_multiplier
+        err = dp + effective_pw * pen + shape_priority * 500 * fid
+
+        if err < fine_best_error:
+            fine_best_error = err
+            fine_best_R, fine_best_t, fine_best_s = R_fine, t_fine, fs
+
+    if fine_best_s != best_s:
+        print(f"  Scale refined: {best_s:.4f} -> {fine_best_s:.4f}")
+    best_R, best_t, best_s = fine_best_R, fine_best_t, fine_best_s
+    best_error = fine_best_error
 
     # =====================================================================
     # LOCAL REFINEMENT PHASE
@@ -970,7 +1179,29 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
 
         dist_error = np.sum(distances ** 2)
         penalty = shape_preservation_penalty(indices, R, t, s)
-        cur_error = dist_error + current_penalty_w * penalty
+
+        # Topology-aware penalty: discourages matches whose street distance is
+        # much larger than their euclidean distance. Expensive, so only every
+        # 10 iterations.
+        topo_penalty = 0.0
+        if G_proj is not None and node_ids is not None and it % 10 == 0:
+            for p1, p2 in E_sketch:
+                u_idx = int(indices[int(p1)])
+                v_idx = int(indices[int(p2)])
+                u_id = node_ids[u_idx]
+                v_id = node_ids[v_idx]
+                euclid = np.linalg.norm(Q_city[u_idx] - Q_city[v_idx])
+                if euclid < 1e-6:
+                    continue
+                try:
+                    street_d = nx.shortest_path_length(
+                        G_proj, u_id, v_id, weight='length')
+                    if street_d > 3 * euclid:
+                        topo_penalty += (street_d - euclid)
+                except nx.NetworkXNoPath:
+                    topo_penalty += euclid * 10  # heavy penalty
+
+        cur_error = dist_error + current_penalty_w * penalty + 0.1 * topo_penalty
 
         if abs(prev_error - cur_error) / max(prev_error, 1e-12) < convergence_tol:
             print(f"  Converged at iteration {it+1} (penalty_w={current_penalty_w:.2f})")
@@ -996,7 +1227,9 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
     if n_angle_refined > 0:
         print(f"  Angle-constrained refinement improved {n_angle_refined} matches")
 
-    return R, t, s, final_indices
+    # Map back to original (un-resampled) sketch points only.
+    final_indices_original = final_indices[original_point_indices]
+    return R, t, s, final_indices_original
 
 # %% [markdown]
 # ## 6. Route-Aware Post-Matching Refinement
@@ -1033,18 +1266,60 @@ def refine_matches_for_routability(G_proj, E_sketch, matched_node_ids, Q_city,
     """
     refined = matched_node_ids.copy()
     n_refined = 0
-
-    # Build reverse lookup: node_id -> index in Q_city
     node_id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
 
+    # Build adjacency: which sketch edges touch each sketch point.
+    point_edges = {}
+    for edge_idx, (p1, p2) in enumerate(E_sketch):
+        point_edges.setdefault(int(p1), []).append(edge_idx)
+        point_edges.setdefault(int(p2), []).append(edge_idx)
+
+    # Precompute candidate city nodes for each sketch point.
+    n_sketch = len(P_final)
+    all_candidates = {}
+    for i in range(n_sketch):
+        _, cands = city_kdtree.query(P_final[i], k=k_candidates)
+        all_candidates[i] = np.atleast_1d(cands)
+
+    # Precompute street distances between OSM node pairs (cache).
+    street_dist_cache = {}
+
+    def cached_street_dist(u_id, v_id):
+        if u_id == v_id:
+            return 0.0
+        key = (u_id, v_id) if u_id < v_id else (v_id, u_id)
+        if key not in street_dist_cache:
+            try:
+                street_dist_cache[key] = nx.shortest_path_length(
+                    G_proj, u_id, v_id, weight='length')
+            except nx.NetworkXNoPath:
+                street_dist_cache[key] = float('inf')
+        return street_dist_cache[key]
+
+    def adjacent_cost(point, candidate_id, partner_point=None):
+        """Sum street distances for all edges incident to `point` in the
+        current refined matching, treating `candidate_id` as the (hypothetical)
+        match for `point`. The edge to `partner_point` is excluded — it is
+        added separately by the caller."""
+        total = 0.0
+        for adj_edge_idx in point_edges.get(point, []):
+            ep1, ep2 = E_sketch[adj_edge_idx]
+            other_point = int(ep2) if int(ep1) == point else int(ep1)
+            if other_point == partner_point:
+                continue
+            other_id = refined[other_point]
+            total += cached_street_dist(candidate_id, other_id)
+        return total
+
     for p1, p2 in E_sketch:
+        p1 = int(p1)
+        p2 = int(p2)
         u_id = refined[p1]
         v_id = refined[p2]
 
         if u_id == v_id:
             continue
 
-        # Euclidean distance between matched city nodes
         u_idx = node_id_to_idx.get(u_id)
         v_idx = node_id_to_idx.get(v_id)
         if u_idx is None or v_idx is None:
@@ -1054,30 +1329,37 @@ def refine_matches_for_routability(G_proj, E_sketch, matched_node_ids, Q_city,
         if euclid_dist < 1e-6:
             continue
 
-        # Street distance
-        try:
-            street_dist = nx.shortest_path_length(G_proj, u_id, v_id, weight='length')
-        except nx.NetworkXNoPath:
+        street_dist = cached_street_dist(u_id, v_id)
+        if street_dist == float('inf'):
             continue
 
         if street_dist <= detour_ratio * euclid_dist:
             continue  # acceptable detour
 
-        # This edge has an excessive detour — try to re-match
-        _, u_candidates = city_kdtree.query(P_final[p1], k=k_candidates)
-        _, v_candidates = city_kdtree.query(P_final[p2], k=k_candidates)
+        u_candidates = all_candidates[p1]
+        v_candidates = all_candidates[p2]
 
-        best_street_dist = street_dist
+        # Baseline: cost of the current matching, summed over the current
+        # edge plus all other edges incident to p1 and p2.
+        current_total = (street_dist
+                         + adjacent_cost(p1, u_id, partner_point=p2)
+                         + adjacent_cost(p2, v_id, partner_point=p1))
+        best_total = current_total
         best_u_id, best_v_id = u_id, v_id
 
         for u_cand_idx in u_candidates:
+            u_cand_idx = int(u_cand_idx)
             u_cand_id = node_ids[u_cand_idx]
-            # Don't move further from sketch position than the original edge length
             cand_dist_u = np.linalg.norm(Q_city[u_cand_idx] - P_final[p1])
             if cand_dist_u > euclid_dist:
                 continue
 
+            u_adj = adjacent_cost(p1, u_cand_id, partner_point=p2)
+            if u_adj == float('inf'):
+                continue
+
             for v_cand_idx in v_candidates:
+                v_cand_idx = int(v_cand_idx)
                 v_cand_id = node_ids[v_cand_idx]
                 if u_cand_id == v_cand_id:
                     continue
@@ -1086,14 +1368,17 @@ def refine_matches_for_routability(G_proj, E_sketch, matched_node_ids, Q_city,
                 if cand_dist_v > euclid_dist:
                     continue
 
-                try:
-                    cand_street = nx.shortest_path_length(
-                        G_proj, u_cand_id, v_cand_id, weight='length')
-                except nx.NetworkXNoPath:
+                edge_cost = cached_street_dist(u_cand_id, v_cand_id)
+                if edge_cost == float('inf'):
                     continue
 
-                if cand_street < best_street_dist:
-                    best_street_dist = cand_street
+                v_adj = adjacent_cost(p2, v_cand_id, partner_point=p1)
+                if v_adj == float('inf'):
+                    continue
+
+                cand_total = edge_cost + u_adj + v_adj
+                if cand_total < best_total:
+                    best_total = cand_total
                     best_u_id, best_v_id = u_cand_id, v_cand_id
 
         if best_u_id != u_id or best_v_id != v_id:
@@ -1152,11 +1437,16 @@ def reduce_odd_degree_by_doubling(G_art, G_proj):
     return total_doubled
 
 
-def eulerize_bounded(G_art, G_proj, outside_penalty=5.0, max_odd_nodes=100):
+def eulerize_bounded(G_art, G_proj, art_edge_set=None,
+                     outside_penalty=5.0, max_odd_nodes=100):
     """
     Geo-fenced Eulerization with progressive distance penalty.
     Pairs odd-degree nodes using min-weight matching, penalizing paths
     that leave the sketch footprint and penalizing long pairings.
+
+    If `art_edge_set` is provided, paths that reuse art edges receive a
+    multiplicative discount, encouraging the matcher to backtrack along the
+    sketch itself rather than introduce new strokes.
     """
     odd_nodes = [n for n in G_art.nodes if G_art.degree(n) % 2 == 1]
     print(f"  Odd-degree nodes: {len(odd_nodes)}")
@@ -1216,6 +1506,18 @@ def eulerize_bounded(G_art, G_proj, outside_penalty=5.0, max_odd_nodes=100):
                 relative_length = path_len / sketch_diameter
                 weight *= (1.0 + relative_length)
 
+            # Shape-aware discount: paths that reuse art edges are cheaper
+            # (each overlapping edge gives a 30% multiplicative discount).
+            if art_edge_set is not None and len(path) > 1:
+                art_overlap_count = sum(
+                    1 for k in range(len(path) - 1)
+                    if (min(path[k], path[k + 1]),
+                        max(path[k], path[k + 1])) in art_edge_set
+                )
+                if art_overlap_count > 0:
+                    overlap_discount = 0.7 ** art_overlap_count
+                    weight *= overlap_discount
+
             odd_graph.add_edge(u, v, weight=weight, path=path)
             odd_paths[(u, v)] = path
             odd_paths[(v, u)] = list(reversed(path))
@@ -1264,7 +1566,7 @@ def create_route_and_gpx(G_proj, G_unproj, matched_node_ids, polygon_parts,
     """
     if not polygon_parts:
         print("No polygon parts to process.")
-        return
+        return None
 
     G_art = nx.MultiGraph()
     G_art.graph = G_proj.graph.copy()
@@ -1312,7 +1614,7 @@ def create_route_and_gpx(G_proj, G_unproj, matched_node_ids, polygon_parts,
 
     if not part_routes or start_node is None:
         print("Could not generate any route segments.")
-        return
+        return None
 
     # 2. Connect multiple parts via street-distance MST (top-3 candidates)
     if len(part_routes) > 1:
@@ -1388,14 +1690,15 @@ def create_route_and_gpx(G_proj, G_unproj, matched_node_ids, polygon_parts,
     # 4. Geo-fenced Eulerization
     if not G_art.nodes or not nx.is_connected(G_art):
         print("Art graph is empty or disconnected. Cannot create route.")
-        return
+        return None
 
     art_edge_set = set()
     for u, v, _ in G_art.edges(keys=True):
         art_edge_set.add((min(u, v), max(u, v)))
 
     G_eulerian, euler_added_edges = eulerize_bounded(
-        G_art, G_proj, outside_penalty=outside_penalty,
+        G_art, G_proj, art_edge_set=art_edge_set,
+        outside_penalty=outside_penalty,
         max_odd_nodes=max_odd_nodes)
 
     circuit = list(nx.eulerian_circuit(G_eulerian, source=start_node))
@@ -1470,6 +1773,8 @@ def create_route_and_gpx(G_proj, G_unproj, matched_node_ids, polygon_parts,
     except Exception as e:
         print(f"  Could not plot: {e}")
 
+    return total_km
+
 
 # %% [markdown]
 # ## 8. Run — Fetch City Data, Shape-Priority Align All Sketches, Generate GPX
@@ -1526,73 +1831,106 @@ if city_loaded and os.path.exists(IMAGE_FOLDER):
             print(f"  Skipping: {e}")
             continue
 
-        # v4 shape-priority ICP alignment
-        R, t, s, matched_indices = find_best_fit_v4(
-            P_sketch, E_sketch, Q_city, ROUTE_DISTANCE_METERS,
-            density_weights=density_weights,
-            num_iterations=ICP_REFINE_ITERATIONS,
-            num_random_samples=ICP_RANDOM_SAMPLES,
-            sample_iterations=ICP_SAMPLE_ITERATIONS,
-            num_rotation_samples=ICP_ROTATION_SAMPLES,
-            convergence_tol=ICP_CONVERGENCE_TOL,
-            penalty_weight=SHAPE_PENALTY_WEIGHT,
-            alpha=SHAPE_ALPHA,
-            beta=SHAPE_BETA,
-            distance_correction=ROUTE_DISTANCE_CORRECTION,
-            penalty_anneal_start=PENALTY_ANNEAL_START,
-            penalty_anneal_end=PENALTY_ANNEAL_END,
-            grid_search=ICP_GRID_SEARCH,
-            grid_step_factor=ICP_GRID_STEP_FACTOR,
-            scale_factors=ICP_SCALE_FACTORS,
-            shape_priority=SHAPE_PRIORITY,
-            shape_constrained_k=SHAPE_CONSTRAINED_K,
-            shape_angle_weight=SHAPE_ANGLE_WEIGHT,
-        )
-
-        matched_node_ids = node_ids[matched_indices]
-        P_final = (R @ (P_sketch * s).T).T + t
-
-        # Route-aware post-matching refinement
-        print("Refining matches for routability...")
-        matched_node_ids, n_refined = refine_matches_for_routability(
-            G_city_proj, E_sketch, matched_node_ids, Q_city, node_ids,
-            city_kdtree, P_final,
-            detour_ratio=DETOUR_RATIO_THRESHOLD,
-            k_candidates=DETOUR_K_CANDIDATES,
-        )
-        print(f"  Re-matched {n_refined} edges with excessive detours")
-
-        # Plot alignment — zoomed to sketch bounding box
-        fig, ax = ox.plot_graph(G_city_proj, show=False, close=False,
-                                node_size=5, edge_color='gray', bgcolor='w')
-        for i, part_idx in enumerate(polygon_parts):
-            pts = P_final[part_idx]
-            status = "closed" if is_closed[i] else "open"
-            ax.plot(pts[:, 0], pts[:, 1], '-o', markersize=4,
-                    label=f'Part {i+1} ({status})')
-        # Zoom to aligned sketch bounding box
-        all_pts = np.vstack([P_final[pi] for pi in polygon_parts])
-        x_min, y_min = all_pts.min(axis=0)
-        x_max, y_max = all_pts.max(axis=0)
-        x_pad = max((x_max - x_min) * 0.15, 50)
-        y_pad = max((y_max - y_min) * 0.15, 50)
-        ax.set_xlim(x_min - x_pad, x_max + x_pad)
-        ax.set_ylim(y_min - y_pad, y_max + y_pad)
-        plt.title(f"ICP v4 [{extraction_mode}] '{image_file}' on {CITY_NAME}")
-        plt.legend()
-        align_img_path = os.path.join(
-            OUTPUT_FOLDER, f"v4_align_{os.path.splitext(image_file)[0]}.png")
-        _safe_savefig(align_img_path, bbox_inches='tight')
-        print(f"  Alignment image saved: {align_img_path}")
-        plt.show()
-
-        # Generate route & GPX
+        # =====================================================================
+        # Post-hoc distance correction loop: run alignment + routing, measure
+        # the actual routed distance, and adjust the scale-correction factor
+        # until the route is within DISTANCE_CORRECTION_TOLERANCE of the target
+        # (or DISTANCE_CORRECTION_MAX_ITERS retries are exhausted).
+        # =====================================================================
+        distance_correction = DISTANCE_CORRECTION_INITIAL
+        target_km = ROUTE_DISTANCE_KM
+        total_km = None
         output_path = os.path.join(
             OUTPUT_FOLDER, f"v4_route_{os.path.splitext(image_file)[0]}.gpx")
-        create_route_and_gpx(
-            G_city_proj, G_city, matched_node_ids, polygon_parts, is_closed,
-            output_path, outside_penalty=GEO_FENCE_OUTSIDE_PENALTY,
-            max_odd_nodes=MAX_ODD_NODES_FOR_CUSTOM_EULER)
+
+        for correction_iter in range(DISTANCE_CORRECTION_MAX_ITERS + 1):
+            if correction_iter > 0:
+                if total_km is None:
+                    print(f"  Distance correction iter {correction_iter}: previous "
+                          f"iteration produced no route, aborting correction loop.")
+                    break
+                actual_km = total_km
+                if abs(actual_km - target_km) / target_km <= DISTANCE_CORRECTION_TOLERANCE:
+                    print(f"  Distance within tolerance "
+                          f"({actual_km:.1f} km vs {target_km:.1f} km target)")
+                    break
+                correction_factor = target_km / actual_km
+                distance_correction *= correction_factor
+                print(f"  Distance correction iter {correction_iter}: "
+                      f"{actual_km:.1f} km -> target {target_km:.1f} km, "
+                      f"new correction={distance_correction:.3f}")
+
+            # v4 shape-priority ICP alignment
+            R, t, s, matched_indices = find_best_fit_v4(
+                P_sketch, E_sketch, Q_city, ROUTE_DISTANCE_METERS,
+                density_weights=density_weights,
+                num_iterations=ICP_REFINE_ITERATIONS,
+                num_random_samples=ICP_RANDOM_SAMPLES,
+                sample_iterations=ICP_SAMPLE_ITERATIONS,
+                num_rotation_samples=ICP_ROTATION_SAMPLES,
+                convergence_tol=ICP_CONVERGENCE_TOL,
+                penalty_weight=SHAPE_PENALTY_WEIGHT,
+                alpha=SHAPE_ALPHA,
+                beta=SHAPE_BETA,
+                distance_correction=distance_correction,
+                penalty_anneal_start=PENALTY_ANNEAL_START,
+                penalty_anneal_end=PENALTY_ANNEAL_END,
+                grid_search=ICP_GRID_SEARCH,
+                grid_step_factor=ICP_GRID_STEP_FACTOR,
+                scale_factors=ICP_SCALE_FACTORS,
+                shape_priority=SHAPE_PRIORITY,
+                shape_constrained_k=SHAPE_CONSTRAINED_K,
+                shape_angle_weight=SHAPE_ANGLE_WEIGHT,
+                G_proj=G_city_proj,
+                node_ids=node_ids,
+            )
+
+            matched_node_ids = node_ids[matched_indices]
+            P_final = (R @ (P_sketch * s).T).T + t
+
+            # Route-aware post-matching refinement
+            print("Refining matches for routability...")
+            matched_node_ids, n_refined = refine_matches_for_routability(
+                G_city_proj, E_sketch, matched_node_ids, Q_city, node_ids,
+                city_kdtree, P_final,
+                detour_ratio=DETOUR_RATIO_THRESHOLD,
+                k_candidates=DETOUR_K_CANDIDATES,
+            )
+            print(f"  Re-matched {n_refined} edges with excessive detours")
+
+            # Plot alignment — zoomed to sketch bounding box
+            fig, ax = ox.plot_graph(G_city_proj, show=False, close=False,
+                                    node_size=5, edge_color='gray', bgcolor='w')
+            for i, part_idx in enumerate(polygon_parts):
+                pts = P_final[part_idx]
+                status = "closed" if is_closed[i] else "open"
+                ax.plot(pts[:, 0], pts[:, 1], '-o', markersize=4,
+                        label=f'Part {i+1} ({status})')
+            # Zoom to aligned sketch bounding box
+            all_pts = np.vstack([P_final[pi] for pi in polygon_parts])
+            x_min, y_min = all_pts.min(axis=0)
+            x_max, y_max = all_pts.max(axis=0)
+            x_pad = max((x_max - x_min) * 0.15, 50)
+            y_pad = max((y_max - y_min) * 0.15, 50)
+            ax.set_xlim(x_min - x_pad, x_max + x_pad)
+            ax.set_ylim(y_min - y_pad, y_max + y_pad)
+            plt.title(f"ICP v4 [{extraction_mode}] '{image_file}' on {CITY_NAME}")
+            plt.legend()
+            align_img_path = os.path.join(
+                OUTPUT_FOLDER, f"v4_align_{os.path.splitext(image_file)[0]}.png")
+            _safe_savefig(align_img_path, bbox_inches='tight')
+            print(f"  Alignment image saved: {align_img_path}")
+            plt.show()
+
+            # Generate route & GPX
+            total_km = create_route_and_gpx(
+                G_city_proj, G_city, matched_node_ids, polygon_parts, is_closed,
+                output_path, outside_penalty=GEO_FENCE_OUTSIDE_PENALTY,
+                max_odd_nodes=MAX_ODD_NODES_FOR_CUSTOM_EULER)
+
+        if total_km is not None:
+            print(f"  Final route: {total_km:.1f} km vs {target_km:.1f} km target "
+                  f"(correction={distance_correction:.3f})")
 
 elif not city_loaded:
     print("City data failed to load.")
