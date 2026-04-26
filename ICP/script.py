@@ -1079,6 +1079,18 @@ def find_best_fit_v4(P_sketch, E_sketch, Q_city, route_distance_meters,
             print(f"  Street-distance rescoring promoted a different candidate "
                   f"(scale {sb_s:.4f}).")
         best_R, best_t, best_s = sb_R, sb_t, sb_s
+        # Recompute best_error for the chosen candidate using the same scoring
+        # formula the fine-scale sweep uses below (without the euler-overhead
+        # term). This keeps the fine-sweep's initial threshold consistent with
+        # both the current candidate AND the scoring formula it compares.
+        P_best_for_err = (best_R @ (P_sketch * best_s).T).T + best_t
+        _bd, _bi = city_kdtree.query(P_best_for_err)
+        _n_city = len(Q_city)
+        _dp = np.sum(_bd ** 2 / (density_weights[_bi] * _n_city + 1e-12))
+        _pen = shape_preservation_penalty(_bi, best_R, best_t, best_s)
+        _fid = shape_fidelity_score(_bi, best_R, best_t, best_s)
+        _epw = penalty_weight * shape_multiplier
+        best_error = _dp + _epw * _pen + shape_priority * 500 * _fid
 
     # =====================================================================
     # FINE-GRAINED SCALE SWEEP around the chosen candidate
@@ -1285,9 +1297,11 @@ def refine_matches_for_routability(G_proj, E_sketch, matched_node_ids, Q_city,
     street_dist_cache = {}
 
     def cached_street_dist(u_id, v_id):
+        # G_proj is a directed MultiDiGraph (one-way streets), so shortest-path
+        # distance is not symmetric: u->v and v->u may differ.
         if u_id == v_id:
             return 0.0
-        key = (u_id, v_id) if u_id < v_id else (v_id, u_id)
+        key = (u_id, v_id)
         if key not in street_dist_cache:
             try:
                 street_dist_cache[key] = nx.shortest_path_length(
